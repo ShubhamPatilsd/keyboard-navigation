@@ -1,0 +1,7 @@
+[project]
+name = "keyboard-navigation"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = ["screeninfo", "PyQt5", "pynput", "pyobjc-framework-Cocoa"]
