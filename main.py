@@ -172,6 +172,7 @@ class GridOverlay(QMainWindow):
                         NSWindowCollectionBehaviorStationary
                     )
                     ns_window.setIgnoresMouseEvents_(True)
+                    ns_window.setHasShadow_(False)  # Remove shadow/border
                     ns_window.orderFrontRegardless()  # Force to front
                     print(f"[DEBUG] Set window level to {target_level}, new level: {ns_window.level()}")
                     return
@@ -187,6 +188,7 @@ class GridOverlay(QMainWindow):
                         NSWindowCollectionBehaviorStationary
                     )
                     ns_window.setIgnoresMouseEvents_(True)
+                    ns_window.setHasShadow_(False)  # Remove shadow/border
                     ns_window.orderFrontRegardless()
                     print(f"[DEBUG] Set window level to {target_level}, new level: {ns_window.level()}")
                     return
