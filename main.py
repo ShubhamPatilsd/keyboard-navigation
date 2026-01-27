@@ -9,6 +9,7 @@ from PyQt5.QtGui import QPainter, QColor, QPen
 from screeninfo import get_monitors
 from pynput import keyboard
 from pynput.mouse import Controller as MouseController, Button
+import pyautogui
 from Cocoa import NSApp, NSWindow, NSObject
 from AppKit import (
     NSWindowCollectionBehaviorCanJoinAllSpaces,
@@ -32,7 +33,13 @@ from Quartz import (
     CGWindowListCopyWindowInfo,
     kCGWindowListOptionOnScreenOnly,
     kCGNullWindowID,
-    CGWindowListCreateDescriptionFromArray
+    CGWindowListCreateDescriptionFromArray,
+    CGEventCreateMouseEvent,
+    CGEventPost,
+    kCGEventLeftMouseDown,
+    kCGEventLeftMouseUp,
+    kCGHIDEventTap,
+    kCGMouseButtonLeft
 )
 from AppKit import NSWorkspace, NSRunningApplication
 from Foundation import NSMakeRect, NSMakeSize
@@ -132,8 +139,8 @@ class GridOverlay(QMainWindow):
         self.initialize_overlay()
 
     def keep_on_top(self):
-        """Periodically raise window to stay on top."""
-        self.raise_()
+        """Periodically ensure window stays at correct level without stealing focus."""
+        # Just ensure window level is correct - don't call raise_() as it steals focus
         self.set_window_level_above_menubar()
 
     def set_window_level_above_menubar(self):
@@ -214,15 +221,22 @@ class GridOverlay(QMainWindow):
         self.region_active = False
         self.history.clear()
 
-        # Show window first
+        # Store the currently active app so we don't steal focus
+        from AppKit import NSWorkspace
+        active_app = NSWorkspace.sharedWorkspace().frontmostApplication()
+
+        # Show window first (without activating)
         self.show()
-        self.raise_()
 
         # Process events to ensure window is created
         QApplication.processEvents()
 
-        # Set window level immediately
+        # Set window level immediately - this will keep it on top without focus
         self.set_window_level_above_menubar()
+
+        # Ensure focus stays on the active app
+        if active_app:
+            active_app.activateWithOptions_(0)
 
         # Also set it again after a tiny delay to ensure it sticks
         QtCore.QTimer.singleShot(50, self.set_window_level_above_menubar)
@@ -277,14 +291,24 @@ class GridOverlay(QMainWindow):
     def find_and_activate_app_at_point(self, x, y):
         """Find the application at the given point and activate it."""
         try:
+            import os
+
+            # Get our own PID to exclude it
+            our_pid = os.getpid()
+
             # Get all on-screen windows
             window_list = CGWindowListCopyWindowInfo(
                 kCGWindowListOptionOnScreenOnly,
                 kCGNullWindowID
             )
 
-            # Find windows at this point
+            # Find windows at this point (skip our own process)
             for window in window_list:
+                # Skip our own Python process windows
+                owner_pid = window.get('kCGWindowOwnerPID')
+                if owner_pid == our_pid:
+                    continue
+
                 bounds = window.get('kCGWindowBounds', {})
                 win_x = bounds.get('X', 0)
                 win_y = bounds.get('Y', 0)
@@ -296,7 +320,6 @@ class GridOverlay(QMainWindow):
                     win_y <= y <= win_y + win_height):
 
                     # Get the owner PID
-                    owner_pid = window.get('kCGWindowOwnerPID')
                     if owner_pid:
                         # Get the running application
                         app = NSRunningApplication.runningApplicationWithProcessIdentifier_(owner_pid)
@@ -323,6 +346,10 @@ class GridOverlay(QMainWindow):
         click_x, click_y = int(self.mouse.position[0]), int(self.mouse.position[1])
         print(f"[DEBUG] Confirming - will click at ({click_x}, {click_y})")
 
+        # Find and activate the application at the click point BEFORE closing overlay
+        activated = self.find_and_activate_app_at_point(click_x, click_y)
+        print(f"[DEBUG] App activation result: {activated}")
+
         # Stop the raise timer and close window
         self.raise_timer.stop()
         self.close()
@@ -330,16 +357,15 @@ class GridOverlay(QMainWindow):
         # Process events to ensure window is gone
         QApplication.processEvents()
 
-        # Find and activate the application at the click point
-        self.find_and_activate_app_at_point(click_x, click_y)
+        # Small delay to ensure window is fully closed and app is focused
+        time.sleep(0.1)
 
-        # Perform the click using osascript
-        subprocess.run([
-            'osascript', '-e',
-            f'tell application "System Events" to click at {{{click_x}, {click_y}}}'
-        ], capture_output=True)
-
-        print(f"[DEBUG] Clicked at ({click_x}, {click_y})")
+        # Use pyautogui to click
+        try:
+            pyautogui.click(click_x, click_y)
+            print(f"[DEBUG] Clicked at ({click_x}, {click_y}) using pyautogui")
+        except Exception as e:
+            print(f"[DEBUG] pyautogui click failed: {e}")
 
         # Destroy this window instance completely
         self.deleteLater()
@@ -368,11 +394,11 @@ class GridOverlay(QMainWindow):
             painter.fillRect(
                 int(self.region_x), int(self.region_y),
                 int(self.region_width), int(self.region_height),
-                QColor(255, 192, 203, 100)
+                QColor(67, 122, 255, 100)  # #437AFF with alpha 100
             )
 
         # Draw grid lines on current region
-        pen = QPen(QColor(128, 128, 128, 179))  # Gray with 70% opacity
+        pen = QPen(QColor(89, 90, 94, 179))  # #595A5E with 70% opacity
         pen.setWidth(2)
         painter.setPen(pen)
 
@@ -410,6 +436,21 @@ class HotkeyButton(NSButton):
             self.callback(self)
 
 
+class SettingsView(NSView):
+    """Custom view that swallows key events to prevent beeps."""
+
+    def acceptsFirstResponder(self):
+        return True
+
+    def keyDown_(self, event):
+        # Swallow all key events to prevent beep
+        pass
+
+    def keyUp_(self, event):
+        # Swallow all key events
+        pass
+
+
 class SettingsViewController(NSViewController):
     """View controller for the settings popover."""
 
@@ -424,8 +465,8 @@ class SettingsViewController(NSViewController):
 
     def loadView(self):
         """Create the settings view."""
-        # Create main view - smaller, more compact
-        view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, 300, 390))
+        # Create main view - smaller, more compact, using custom view to prevent beeps
+        view = SettingsView.alloc().initWithFrame_(NSMakeRect(0, 0, 300, 390))
 
         # 3x3 Grid of hotkey buttons - packed tightly
         self.grid_buttons = {}
@@ -491,6 +532,12 @@ class SettingsViewController(NSViewController):
 
     def quitClicked_(self, sender):
         """Handle quit button click."""
+        # Finalize any recording in progress
+        if self.recording_button == self.activation_button:
+            self.finalizeActivationHotkey()
+        elif self.recording_button:
+            self.stopRecording()
+
         if self.manager:
             self.manager.quit_app()
         else:
@@ -498,6 +545,14 @@ class SettingsViewController(NSViewController):
 
     def gridButtonClicked_(self, sender):
         """Handle grid button click to record new hotkey."""
+        # Prevent re-clicking while already recording
+        if self.recording_button == sender:
+            return
+
+        # If recording activation hotkey, finalize it first
+        if self.recording_button == self.activation_button:
+            self.finalizeActivationHotkey()
+
         if self.recording_button:
             # Stop recording previous button
             self.stopRecording()
@@ -513,20 +568,35 @@ class SettingsViewController(NSViewController):
 
     def activationButtonClicked_(self, sender):
         """Handle activation button click to record new hotkey."""
+        # If already recording this button, finalize it
+        if self.recording_button == sender:
+            self.finalizeActivationHotkey()
+            return
+
+        # If recording a different button, stop that first
         if self.recording_button:
             self.stopRecording()
 
         self.recording_button = sender
         self.recording_modifiers.clear()
-        sender.setTitle_("Press modifiers + key...")
-        sender.setEnabled_(False)
+        sender.setTitle_("Recording...")
+        # Keep button enabled so user can click again to finalize
 
-        print("[DEBUG] Recording activation hotkey")
+        print("[DEBUG] Recording activation hotkey - press modifiers then click again to save")
 
     def selectionButtonClicked_(self, sender):
         """Handle selection button click to record new hotkey."""
+        # Prevent re-clicking while already recording
+        if self.recording_button == sender:
+            return
+
+        # If recording activation hotkey, finalize it first
+        if self.recording_button == self.activation_button:
+            self.finalizeActivationHotkey()
+
         if self.recording_button:
-            self.stopRecording()
+            print("[DEBUG] Already recording, ignoring click")
+            return
 
         self.recording_button = sender
         sender.setTitle_("Press key...")
@@ -535,12 +605,37 @@ class SettingsViewController(NSViewController):
         print("[DEBUG] Recording selection hotkey")
 
     @objc.python_method
+    def finalizeActivationHotkey(self):
+        """Finalize the activation hotkey recording with current modifiers."""
+        print(f"[DEBUG] Finalizing activation hotkey with modifiers: {self.recording_modifiers}")
+
+        if self.manager:
+            if self.recording_modifiers:
+                # Save the modifier combo
+                self.manager.activation_modifiers = self.recording_modifiers.copy()
+                self.manager.activation_key = None  # Just modifiers, no key
+
+                # Build display string
+                mod_names = [self.get_modifier_name(m) for m in sorted(self.recording_modifiers, key=str)]
+                full_combo = " + ".join(mod_names)
+                self.recording_button.setTitle_(full_combo)
+                print(f"[DEBUG] Set activation to: {full_combo}")
+            else:
+                # No modifiers recorded, revert to default
+                self.recording_button.setTitle_("Ctrl + Option")
+                print(f"[DEBUG] No modifiers recorded, keeping default")
+
+        self.recording_modifiers.clear()
+        self.recording_button = None
+
+    @objc.python_method
     def stopRecording(self):
         """Stop recording hotkey."""
         if self.recording_button:
             self.recording_button.setEnabled_(True)
             self.recording_button = None
         self.recording_modifiers.clear()
+        print(f"[DEBUG] Stopped recording")
 
     @objc.python_method
     def get_modifier_name(self, key):
@@ -582,41 +677,35 @@ class SettingsViewController(NSViewController):
                     normalized_key = keyboard.Key.cmd
 
                 self.recording_modifiers.add(normalized_key)
-                print(f"[DEBUG] Added modifier: {normalized_key}, total: {self.recording_modifiers}")
 
                 # Show current modifiers
                 mod_names = [self.get_modifier_name(m) for m in sorted(self.recording_modifiers, key=str)]
                 if mod_names:
-                    self.recording_button.setTitle_(" + ".join(mod_names) + " + ...")
+                    title = " + ".join(mod_names) + " + ..."
+                    self.recording_button.setTitle_(title)
                 else:
-                    self.recording_button.setTitle_("Press modifiers + key...")
+                    self.recording_button.setTitle_("Recording...")
             else:
-                # Non-modifier key pressed - complete the combo
-                if self.manager and self.recording_modifiers:
-                    self.manager.activation_modifiers = self.recording_modifiers.copy()
+                # Non-modifier key pressed - add to combo
+                # Save the key
+                if self.manager:
                     self.manager.activation_key = key_obj
 
-                    # Build display string
+                # Build display string with modifiers + key
+                if self.recording_modifiers:
                     mod_names = [self.get_modifier_name(m) for m in sorted(self.recording_modifiers, key=str)]
                     full_combo = " + ".join(mod_names + [display_name])
                     self.recording_button.setTitle_(full_combo)
-                    print(f"[DEBUG] Set activation to: {full_combo}")
                 else:
-                    # No modifiers - just show the key
-                    if self.manager:
-                        self.manager.activation_modifiers = set()
-                        self.manager.activation_key = key_obj
+                    # Just the key, no modifiers
                     self.recording_button.setTitle_(display_name)
-                    print(f"[DEBUG] Set activation to: {display_name}")
-
-                self.recording_modifiers.clear()
-                self.stopRecording()
         elif self.recording_button == self.selection_button:
             # Handle selection/confirm key
             if self.manager:
                 self.manager.selection_key = key_obj
                 print(f"[DEBUG] Set selection key to: {display_name}")
             self.recording_button.setTitle_(display_name)
+            self.stopRecording()
         else:
             # Handle grid hotkey
             row, col = self.button_positions.get(self.recording_button, (None, None))
@@ -635,8 +724,7 @@ class SettingsViewController(NSViewController):
                 print(f"[DEBUG] Mapped {display_name} to position ({row}, {col})")
 
             self.recording_button.setTitle_(display_name)
-
-        self.stopRecording()
+            self.stopRecording()
 
 
 class MenuBarManager(NSObject):
@@ -737,6 +825,10 @@ class MenuBarManager(NSObject):
                         button,
                         3  # NSMinYEdge (below the status item)
                     )
+
+                    # Make the view first responder to swallow key events
+                    if hasattr(view, 'window') and view.window():
+                        view.window().makeFirstResponder_(view)
         except Exception as e:
             import traceback
             print(f"[DEBUG] Exception in showSettings_: {e}")
@@ -793,12 +885,20 @@ class OverlayManager(QObject):
         # Handle special keys
         if hasattr(key, 'name'):
             # It's a Key enum (like Key.enter, Key.shift, etc.)
+            if key.name == 'enter':
+                # Check if it's numpad enter by vk code
+                if hasattr(key, 'vk') and key.vk == 76:  # Numpad Enter on macOS
+                    return "NumEnter"
+                return "Enter"
             return key.name.title()
 
         # Handle character keys with vk codes
         if hasattr(key, 'vk'):
+            # Numpad Enter (vk 76 on macOS)
+            if key.vk == 76:
+                return "NumEnter"
             # Check for numpad keys (vk codes 96-105 on most systems)
-            if key.vk >= 96 and key.vk <= 105:
+            elif key.vk >= 96 and key.vk <= 105:
                 return f"Num{key.vk - 96}"
             # Check for function keys
             elif key.vk >= 112 and key.vk <= 135:
@@ -808,7 +908,9 @@ class OverlayManager(QObject):
         if hasattr(key, 'char') and key.char:
             return key.char.upper()
 
-        # Fallback
+        # Fallback - show vk code if available
+        if hasattr(key, 'vk'):
+            return f"Key{key.vk}"
         return str(key)
 
     def start_hotkey_listener(self):
