@@ -9,12 +9,24 @@ from PyQt5.QtGui import QPainter, QColor, QPen
 from screeninfo import get_monitors
 from pynput import keyboard
 from pynput.mouse import Controller as MouseController, Button
-from Cocoa import NSApp, NSWindow
+from Cocoa import NSApp, NSWindow, NSObject
 from AppKit import (
     NSWindowCollectionBehaviorCanJoinAllSpaces,
     NSWindowCollectionBehaviorStationary,
     NSApplicationActivationPolicyAccessory,
-    NSApplicationActivationPolicyRegular
+    NSApplicationActivationPolicyRegular,
+    NSStatusBar,
+    NSMenu,
+    NSMenuItem,
+    NSPopover,
+    NSViewController,
+    NSView,
+    NSButton,
+    NSTextField,
+    NSFont,
+    NSColor,
+    NSBorderlessWindowMask,
+    NSPopoverBehaviorTransient
 )
 from Quartz import (
     CGWindowListCopyWindowInfo,
@@ -23,6 +35,8 @@ from Quartz import (
     CGWindowListCreateDescriptionFromArray
 )
 from AppKit import NSWorkspace, NSRunningApplication
+from Foundation import NSMakeRect, NSMakeSize
+import objc
 
 
 def choose_screen():
@@ -376,6 +390,365 @@ class GridOverlay(QMainWindow):
             painter.drawLine(int(rx), y, int(rx + rw), y)
 
 
+class HotkeyButton(NSButton):
+    """Custom button for hotkey recording."""
+
+    def initWithFrame_callback_(self, frame, callback):
+        self = objc.super(HotkeyButton, self).initWithFrame_(frame)
+        if self:
+            self.callback = callback
+            self.setButtonType_(0)  # Momentary push button
+            self.setBordered_(True)
+            self.setBezelStyle_(1)  # Rounded
+            self.setTarget_(self)
+            self.setAction_('buttonClicked:')
+        return self
+
+    @objc.python_method
+    def buttonClicked_(self, sender):
+        if self.callback:
+            self.callback(self)
+
+
+class SettingsViewController(NSViewController):
+    """View controller for the settings popover."""
+
+    def init(self):
+        self = objc.super(SettingsViewController, self).init()
+        if self:
+            self.manager = None
+            self.recording_button = None
+            self.button_positions = {}  # Maps button object to (row, col)
+            self.recording_modifiers = set()  # Track modifiers when recording activation hotkey
+        return self
+
+    def loadView(self):
+        """Create the settings view."""
+        # Create main view - smaller, more compact
+        view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, 300, 390))
+
+        # 3x3 Grid of hotkey buttons - packed tightly
+        self.grid_buttons = {}
+        button_size = 100
+        spacing = 0  # No spacing - buttons touch
+        start_x = 0
+        start_y = 90
+
+        positions = [
+            ('q', 0, 0), ('w', 0, 1), ('e', 0, 2),
+            ('a', 1, 0), ('s', 1, 1), ('d', 1, 2),
+            ('z', 2, 0), ('x', 2, 1), ('c', 2, 2),
+        ]
+
+        for key, row, col in positions:
+            x = start_x + col * button_size
+            y = start_y + (2 - row) * button_size  # Flip y-axis
+
+            button = NSButton.alloc().initWithFrame_(NSMakeRect(x, y, button_size, button_size))
+            button.setTitle_(key.upper())
+            button.setButtonType_(0)
+            button.setBordered_(True)
+            button.setBezelStyle_(4)  # Recessed bezel - square buttons that fill space
+            button.setFont_(NSFont.systemFontOfSize_(24))  # Larger font
+            button.setTarget_(self)
+            button.setAction_('gridButtonClicked:')
+            button.setIdentifier_(f"{row},{col}")  # Store position as identifier
+            view.addSubview_(button)
+            self.grid_buttons[(row, col)] = button
+            self.button_positions[button] = (row, col)
+
+        # Activation hotkey button (full width at top)
+        self.activation_button = NSButton.alloc().initWithFrame_(NSMakeRect(0, 45, 150, 40))
+        self.activation_button.setTitle_("Ctrl + Option")
+        self.activation_button.setButtonType_(0)
+        self.activation_button.setBordered_(True)
+        self.activation_button.setBezelStyle_(4)
+        self.activation_button.setTarget_(self)
+        self.activation_button.setAction_('activationButtonClicked:')
+        view.addSubview_(self.activation_button)
+
+        # Selection/Confirm key button
+        self.selection_button = NSButton.alloc().initWithFrame_(NSMakeRect(150, 45, 150, 40))
+        self.selection_button.setTitle_("Enter")
+        self.selection_button.setButtonType_(0)
+        self.selection_button.setBordered_(True)
+        self.selection_button.setBezelStyle_(4)
+        self.selection_button.setTarget_(self)
+        self.selection_button.setAction_('selectionButtonClicked:')
+        view.addSubview_(self.selection_button)
+
+        # Quit button at bottom
+        quit_button = NSButton.alloc().initWithFrame_(NSMakeRect(100, 10, 100, 30))
+        quit_button.setTitle_("Quit")
+        quit_button.setButtonType_(0)
+        quit_button.setBordered_(True)
+        quit_button.setBezelStyle_(4)
+        quit_button.setTarget_(self)
+        quit_button.setAction_('quitClicked:')
+        view.addSubview_(quit_button)
+
+        self.setView_(view)
+
+    def quitClicked_(self, sender):
+        """Handle quit button click."""
+        if self.manager:
+            self.manager.quit_app()
+        else:
+            QApplication.quit()
+
+    def gridButtonClicked_(self, sender):
+        """Handle grid button click to record new hotkey."""
+        if self.recording_button:
+            # Stop recording previous button
+            self.stopRecording()
+
+        # Start recording this button
+        self.recording_button = sender
+        old_title = sender.title()
+        sender.setTitle_("...")
+        sender.setEnabled_(False)
+
+        row, col = self.button_positions.get(sender, (None, None))
+        print(f"[DEBUG] Recording hotkey for position ({row}, {col})")
+
+    def activationButtonClicked_(self, sender):
+        """Handle activation button click to record new hotkey."""
+        if self.recording_button:
+            self.stopRecording()
+
+        self.recording_button = sender
+        self.recording_modifiers.clear()
+        sender.setTitle_("Press modifiers + key...")
+        sender.setEnabled_(False)
+
+        print("[DEBUG] Recording activation hotkey")
+
+    def selectionButtonClicked_(self, sender):
+        """Handle selection button click to record new hotkey."""
+        if self.recording_button:
+            self.stopRecording()
+
+        self.recording_button = sender
+        sender.setTitle_("Press key...")
+        sender.setEnabled_(False)
+
+        print("[DEBUG] Recording selection hotkey")
+
+    @objc.python_method
+    def stopRecording(self):
+        """Stop recording hotkey."""
+        if self.recording_button:
+            self.recording_button.setEnabled_(True)
+            self.recording_button = None
+        self.recording_modifiers.clear()
+
+    @objc.python_method
+    def get_modifier_name(self, key):
+        """Get display name for a modifier key."""
+        if key == keyboard.Key.ctrl or key == keyboard.Key.ctrl_l or key == keyboard.Key.ctrl_r:
+            return "Ctrl"
+        elif key == keyboard.Key.alt or key == keyboard.Key.alt_l or key == keyboard.Key.alt_r:
+            return "Option"
+        elif key == keyboard.Key.shift or key == keyboard.Key.shift_l or key == keyboard.Key.shift_r:
+            return "Shift"
+        elif key == keyboard.Key.cmd or key == keyboard.Key.cmd_l or key == keyboard.Key.cmd_r:
+            return "Cmd"
+        return str(key)
+
+    @objc.python_method
+    def recordKey(self, key_obj, display_name, is_modifier=False):
+        """Record a key for the currently recording button.
+
+        Args:
+            key_obj: The pynput key object (Key enum or KeyCode)
+            display_name: Human-readable name to display
+            is_modifier: Whether this is a modifier key
+        """
+        if not self.recording_button:
+            return
+
+        if self.recording_button == self.activation_button:
+            # Track modifiers
+            if is_modifier:
+                # Normalize modifier keys (ctrl_l/ctrl_r -> ctrl)
+                normalized_key = key_obj
+                if key_obj in [keyboard.Key.ctrl_l, keyboard.Key.ctrl_r]:
+                    normalized_key = keyboard.Key.ctrl
+                elif key_obj in [keyboard.Key.alt_l, keyboard.Key.alt_r]:
+                    normalized_key = keyboard.Key.alt
+                elif key_obj in [keyboard.Key.shift_l, keyboard.Key.shift_r]:
+                    normalized_key = keyboard.Key.shift
+                elif key_obj in [keyboard.Key.cmd_l, keyboard.Key.cmd_r]:
+                    normalized_key = keyboard.Key.cmd
+
+                self.recording_modifiers.add(normalized_key)
+                print(f"[DEBUG] Added modifier: {normalized_key}, total: {self.recording_modifiers}")
+
+                # Show current modifiers
+                mod_names = [self.get_modifier_name(m) for m in sorted(self.recording_modifiers, key=str)]
+                if mod_names:
+                    self.recording_button.setTitle_(" + ".join(mod_names) + " + ...")
+                else:
+                    self.recording_button.setTitle_("Press modifiers + key...")
+            else:
+                # Non-modifier key pressed - complete the combo
+                if self.manager and self.recording_modifiers:
+                    self.manager.activation_modifiers = self.recording_modifiers.copy()
+                    self.manager.activation_key = key_obj
+
+                    # Build display string
+                    mod_names = [self.get_modifier_name(m) for m in sorted(self.recording_modifiers, key=str)]
+                    full_combo = " + ".join(mod_names + [display_name])
+                    self.recording_button.setTitle_(full_combo)
+                    print(f"[DEBUG] Set activation to: {full_combo}")
+                else:
+                    # No modifiers - just show the key
+                    if self.manager:
+                        self.manager.activation_modifiers = set()
+                        self.manager.activation_key = key_obj
+                    self.recording_button.setTitle_(display_name)
+                    print(f"[DEBUG] Set activation to: {display_name}")
+
+                self.recording_modifiers.clear()
+                self.stopRecording()
+        elif self.recording_button == self.selection_button:
+            # Handle selection/confirm key
+            if self.manager:
+                self.manager.selection_key = key_obj
+                print(f"[DEBUG] Set selection key to: {display_name}")
+            self.recording_button.setTitle_(display_name)
+        else:
+            # Handle grid hotkey
+            row, col = self.button_positions.get(self.recording_button, (None, None))
+
+            if row is not None and self.manager:
+                # Remove any existing mapping for this position
+                old_key = None
+                for k, (r, c) in list(self.manager.key_map.items()):
+                    if r == row and c == col:
+                        old_key = k
+                        del self.manager.key_map[k]
+                        break
+
+                # Add new mapping
+                self.manager.key_map[key_obj] = (row, col)
+                print(f"[DEBUG] Mapped {display_name} to position ({row}, {col})")
+
+            self.recording_button.setTitle_(display_name)
+
+        self.stopRecording()
+
+
+class MenuBarManager(NSObject):
+    """Manages the menu bar status item and popover."""
+
+    def init(self):
+        self = objc.super(MenuBarManager, self).init()
+        if self:
+            print("[DEBUG] MenuBarManager.init() called")
+            self.overlay_manager = None
+            self.setupMenuBar()
+            print("[DEBUG] MenuBarManager.init() complete")
+        return self
+
+    @objc.python_method
+    def setupMenuBar(self):
+        """Setup the menu bar status item."""
+        print("[DEBUG] setupMenuBar() called")
+        # Create status item
+        self.status_bar = NSStatusBar.systemStatusBar()
+        print(f"[DEBUG] Got system status bar: {self.status_bar}")
+
+        self.status_item = self.status_bar.statusItemWithLength_(40.0)  # Fixed width to ensure it shows
+        print(f"[DEBUG] Created status item: {self.status_item}")
+
+        # Force it to be visible by setting autosave name (this might reset hidden preference)
+        try:
+            self.status_item.setAutosaveName_("KeyboardNavigation")
+            print("[DEBUG] Set autosave name")
+        except:
+            print("[DEBUG] Could not set autosave name")
+
+        # Get the button and configure it
+        button = self.status_item.button()
+        if button:
+            print(f"[DEBUG] Got button: {button}")
+            button.setTitle_("⌨️ KB")
+            print("[DEBUG] Set button title")
+        else:
+            # Fallback to old API
+            self.status_item.setTitle_("⌨️ KB")
+            print("[DEBUG] Set status item title (no button)")
+
+        print(f"[DEBUG] Status item is visible: {self.status_item.isVisible() if hasattr(self.status_item, 'isVisible') else 'N/A'}")
+        print(f"[DEBUG] Status item length: {self.status_item.length()}")
+
+        # Create menu
+        menu = NSMenu.alloc().init()
+
+        # Configure item
+        config_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Configure Hotkeys...",
+            "showSettings:",
+            ""
+        )
+        config_item.setTarget_(self)
+        menu.addItem_(config_item)
+
+        menu.addItem_(NSMenuItem.separatorItem())
+
+        # Quit item
+        quit_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Quit",
+            "quitApp:",
+            "q"
+        )
+        quit_item.setTarget_(self)
+        menu.addItem_(quit_item)
+
+        self.status_item.setMenu_(menu)
+        print("[DEBUG] Menu set on status item")
+
+        # Create popover for settings
+        self.popover = NSPopover.alloc().init()
+        self.settings_controller = SettingsViewController.alloc().init()
+        self.popover.setContentViewController_(self.settings_controller)
+        self.popover.setBehavior_(NSPopoverBehaviorTransient)
+        print("[DEBUG] setupMenuBar() complete")
+
+    def showSettings_(self, sender):
+        """Show the settings popover."""
+        try:
+            if self.popover.isShown():
+                self.popover.close()
+            else:
+                # Update settings controller with current manager
+                if self.overlay_manager:
+                    self.settings_controller.manager = self.overlay_manager
+
+                # Ensure view is loaded
+                view = self.settings_controller.view()
+
+                # Show popover relative to status item
+                button = self.status_item.button()
+                if button:
+                    self.popover.showRelativeToRect_ofView_preferredEdge_(
+                        button.bounds(),
+                        button,
+                        3  # NSMinYEdge (below the status item)
+                    )
+        except Exception as e:
+            import traceback
+            print(f"[DEBUG] Exception in showSettings_: {e}")
+            traceback.print_exc()
+
+    def quitApp_(self, sender):
+        """Quit the application."""
+        if self.overlay_manager:
+            self.overlay_manager.quit_app()
+        else:
+            QApplication.quit()
+
 class OverlayManager(QObject):
     """Manages the lifecycle of overlay windows and global hotkeys."""
 
@@ -392,40 +765,149 @@ class OverlayManager(QObject):
         # Track modifier state
         self.ctrl_pressed = False
         self.option_pressed = False
+        self.shift_pressed = False
+        self.cmd_pressed = False
 
-        # Key to cell mapping (row, col)
+        # Key to cell mapping (row, col) - will store actual key objects
+        # Initialize with default character keys
+        from pynput.keyboard import KeyCode
         self.key_map = {
-            'q': (0, 0), 'w': (0, 1), 'e': (0, 2),
-            'a': (1, 0), 's': (1, 1), 'd': (1, 2),
-            'z': (2, 0), 'x': (2, 1), 'c': (2, 2),
+            KeyCode.from_char('q'): (0, 0), KeyCode.from_char('w'): (0, 1), KeyCode.from_char('e'): (0, 2),
+            KeyCode.from_char('a'): (1, 0), KeyCode.from_char('s'): (1, 1), KeyCode.from_char('d'): (1, 2),
+            KeyCode.from_char('z'): (2, 0), KeyCode.from_char('x'): (2, 1), KeyCode.from_char('c'): (2, 2),
         }
+
+        # Selection/confirm key
+        self.selection_key = keyboard.Key.enter
+
+        # Activation hotkey combo
+        self.activation_modifiers = {keyboard.Key.ctrl, keyboard.Key.alt}  # Default: Ctrl + Option
+        self.activation_key = None  # Just modifiers, no key
 
         # Start global hotkey listener
         self.start_hotkey_listener()
 
+    @staticmethod
+    def get_key_display_name(key):
+        """Get a human-readable display name for a key."""
+        # Handle special keys
+        if hasattr(key, 'name'):
+            # It's a Key enum (like Key.enter, Key.shift, etc.)
+            return key.name.title()
+
+        # Handle character keys with vk codes
+        if hasattr(key, 'vk'):
+            # Check for numpad keys (vk codes 96-105 on most systems)
+            if key.vk >= 96 and key.vk <= 105:
+                return f"Num{key.vk - 96}"
+            # Check for function keys
+            elif key.vk >= 112 and key.vk <= 135:
+                return f"F{key.vk - 111}"
+
+        # Regular character key
+        if hasattr(key, 'char') and key.char:
+            return key.char.upper()
+
+        # Fallback
+        return str(key)
+
     def start_hotkey_listener(self):
         """Start listening for global hotkeys."""
+        def get_current_modifiers():
+            """Get currently pressed modifiers as a normalized set."""
+            current_mods = set()
+            if self.ctrl_pressed:
+                current_mods.add(keyboard.Key.ctrl)
+            if self.option_pressed:
+                current_mods.add(keyboard.Key.alt)
+            if self.shift_pressed:
+                current_mods.add(keyboard.Key.shift)
+            if self.cmd_pressed:
+                current_mods.add(keyboard.Key.cmd)
+            return current_mods
+
         def check_toggle():
-            """Check if both Ctrl and Option are pressed to show/cancel overlay."""
-            if self.ctrl_pressed and self.option_pressed:
-                if self.overlay is not None:
-                    # Cancel existing overlay
-                    self.signals.cancel.emit()
-                else:
-                    # Create new overlay
-                    self.signals.create_and_show_overlay.emit()
+            """Check if the activation combo is pressed."""
+            current_mods = get_current_modifiers()
+
+            # Check if activation combo matches
+            if self.activation_key is None:
+                # Just modifiers, no key required
+                if current_mods == self.activation_modifiers and len(current_mods) > 0:
+                    if self.overlay is not None:
+                        self.signals.cancel.emit()
+                    else:
+                        self.signals.create_and_show_overlay.emit()
+            # If activation_key is set, we'd check for it too (handled in on_press)
 
         def on_press(key):
-            # Track modifier keys
-            if key == keyboard.Key.ctrl:
+            # FIRST: Check if settings is recording a hotkey (highest priority)
+            if hasattr(self, 'menu_bar_manager') and self.menu_bar_manager:
+                controller = self.menu_bar_manager.settings_controller
+                if controller.recording_button:
+                    # Allow Escape to cancel recording
+                    if key == keyboard.Key.esc:
+                        # Restore previous value
+                        if controller.recording_button == controller.activation_button:
+                            controller.recording_button.setTitle_("Ctrl + Option")
+                        elif controller.recording_button == controller.selection_button:
+                            controller.recording_button.setTitle_("Enter")
+                        controller.stopRecording()
+                        return
+
+                    # Recording mode - capture the key with display name
+                    display_name = self.get_key_display_name(key)
+                    is_modifier = key in [
+                        keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r,
+                        keyboard.Key.alt, keyboard.Key.alt_l, keyboard.Key.alt_r,
+                        keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r,
+                        keyboard.Key.cmd, keyboard.Key.cmd_l, keyboard.Key.cmd_r
+                    ]
+
+                    # Also update our internal modifier tracking for display purposes
+                    if key in [keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r]:
+                        self.ctrl_pressed = True
+                    elif key in [keyboard.Key.alt, keyboard.Key.alt_l, keyboard.Key.alt_r]:
+                        self.option_pressed = True
+                    elif key in [keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r]:
+                        self.shift_pressed = True
+                    elif key in [keyboard.Key.cmd, keyboard.Key.cmd_l, keyboard.Key.cmd_r]:
+                        self.cmd_pressed = True
+
+                    controller.recordKey(key, display_name, is_modifier)
+                    return  # Don't process normal hotkeys while recording
+
+            # Track modifier keys (only if NOT recording)
+            if key in [keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r]:
                 self.ctrl_pressed = True
                 check_toggle()
                 return
 
-            if key == keyboard.Key.alt:  # Option key on macOS
+            if key in [keyboard.Key.alt, keyboard.Key.alt_l, keyboard.Key.alt_r]:  # Option key on macOS
                 self.option_pressed = True
                 check_toggle()
                 return
+
+            if key in [keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r]:
+                self.shift_pressed = True
+                check_toggle()
+                return
+
+            if key in [keyboard.Key.cmd, keyboard.Key.cmd_l, keyboard.Key.cmd_r]:
+                self.cmd_pressed = True
+                check_toggle()
+                return
+
+            # Check if this key completes the activation combo
+            if self.activation_key is not None:
+                current_mods = get_current_modifiers()
+
+                if current_mods == self.activation_modifiers and key == self.activation_key:
+                    if self.overlay is not None:
+                        self.signals.cancel.emit()
+                    else:
+                        self.signals.create_and_show_overlay.emit()
+                    return
 
             # Only process other keys if overlay is visible
             if self.overlay is None:
@@ -436,16 +918,13 @@ class OverlayManager(QObject):
                 self.signals.quit_app.emit()
                 return
 
-            # Check for grid keys
-            try:
-                if hasattr(key, 'char') and key.char in self.key_map:
-                    row, col = self.key_map[key.char]
-                    self.signals.highlight_cell.emit(row, col)
-            except:
-                pass
+            # Check for grid keys using key objects
+            if key in self.key_map:
+                row, col = self.key_map[key]
+                self.signals.highlight_cell.emit(row, col)
 
-            # Enter to confirm selection
-            if key == keyboard.Key.enter:
+            # Check for selection/confirm key
+            if key == self.selection_key:
                 self.signals.confirm.emit()
 
             # Escape to go back one level
@@ -453,10 +932,14 @@ class OverlayManager(QObject):
                 self.signals.go_back.emit()
 
         def on_release(key):
-            if key == keyboard.Key.ctrl:
+            if key in [keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r]:
                 self.ctrl_pressed = False
-            if key == keyboard.Key.alt:
+            if key in [keyboard.Key.alt, keyboard.Key.alt_l, keyboard.Key.alt_r]:
                 self.option_pressed = False
+            if key in [keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r]:
+                self.shift_pressed = False
+            if key in [keyboard.Key.cmd, keyboard.Key.cmd_l, keyboard.Key.cmd_r]:
+                self.cmd_pressed = False
 
         self.listener = keyboard.Listener(
             on_press=on_press,
@@ -497,17 +980,23 @@ def main():
     print("  Q/W/E/A/S/D/Z/X/C = select grid cell")
     print("  Enter = confirm and click at current position")
     print("  Escape = go back one level (or cancel if at top level)")
-    print("  Ctrl+Escape = quit app")
+    print("  ⌨️ Menu bar icon = configure hotkeys and quit")
 
     app = QApplication(sys.argv)
 
-    # Hide from dock and menu bar
+    # Hide from dock (but keep menu bar icon)
     NSApp.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
 
     # Create the overlay manager (runs in background)
     manager = OverlayManager(monitor)
 
+    # Create menu bar manager
+    menu_bar_manager = MenuBarManager.alloc().init()
+    menu_bar_manager.overlay_manager = manager
+    manager.menu_bar_manager = menu_bar_manager
+
     print("[DEBUG] App running in background. Press Ctrl+Option to show overlay.")
+    print("[DEBUG] Click ⌨️ in menu bar to configure hotkeys.")
     sys.exit(app.exec_())
 
 
