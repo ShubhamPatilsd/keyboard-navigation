@@ -221,10 +221,6 @@ class GridOverlay(QMainWindow):
         self.region_active = False
         self.history.clear()
 
-        # Store the currently active app so we don't steal focus
-        from AppKit import NSWorkspace
-        active_app = NSWorkspace.sharedWorkspace().frontmostApplication()
-
         # Show window first (without activating)
         self.show()
 
@@ -233,10 +229,6 @@ class GridOverlay(QMainWindow):
 
         # Set window level immediately - this will keep it on top without focus
         self.set_window_level_above_menubar()
-
-        # Ensure focus stays on the active app
-        if active_app:
-            active_app.activateWithOptions_(0)
 
         # Also set it again after a tiny delay to ensure it sticks
         QtCore.QTimer.singleShot(50, self.set_window_level_above_menubar)
